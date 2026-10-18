@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality and type checking
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Type check
+        run: bun x tsc --noEmit
+
+  tests:
+    name: Tests with PostgreSQL and LocalStack
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: financial_test_db
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d financial_test_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      localstack:
+        image: localstack/localstack:3.8.1
+        env:
+          SERVICES: sqs
+          AWS_DEFAULT_REGION: us-east-1
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -fsS http://localhost:4566/_localstack/health || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DB_TEST_HOST: 127.0.0.1
+      DB_TEST_PORT: 5433
+      DB_TEST_USER: postgres
+      DB_TEST_PASSWORD: postgres
+      DB_TEST_NAME: financial_test_db
+      SQS_TEST_ENDPOINT: http://127.0.0.1:4566
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Wait for LocalStack SQS
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4566/_localstack/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "LocalStack did not become healthy" >&2
+          exit 1
+
+      - name: Unit and domain tests
+        run: bun test --max-concurrency 1 src test/domain test/application test/presentation test/infrastructure
+
+      - name: Integration tests
+        run: bun test --max-concurrency 1 test/integration
+
+      - name: End-to-end tests
+        run: bun test --max-concurrency 1 test/e2e
+
+  docker:
+    name: Build production container
+    runs-on: ubuntu-latest
+    needs:
+      - quality
+      - tests
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: financial-service:ci
